@@ -541,6 +541,8 @@ pub struct RateController {
     writer_blocked: bool,
     got_ack: bool,
     streams: u32,
+    /// The most streams this session has encoded, which bounds `max`.
+    peak_streams: u32,
     pixels: u64,
 }
 
@@ -574,6 +576,7 @@ impl RateController {
             writer_blocked: false,
             got_ack: false,
             streams: streams.max(1),
+            peak_streams: streams.max(1),
             pixels,
         };
         ctl.set_bounds(pixels, streams, max_fps);
@@ -584,7 +587,12 @@ impl RateController {
     fn set_bounds(&mut self, pixels: u64, streams: u32, max_fps: u32) {
         self.pixels = pixels;
         self.streams = streams.max(1);
-        self.max = ((pixels as f64 * streams.max(1) as f64 * max_fps as f64 * MAX_BPP) as u64)
+        self.peak_streams = self.peak_streams.max(self.streams);
+        // Bounded by the most streams the session has used, not the active
+        // count: after the ladder drops to Single420 the target must still
+        // be able to grow to what restoring the second stream needs, or
+        // full chroma never comes back.
+        self.max = ((pixels as f64 * self.peak_streams as f64 * max_fps as f64 * MAX_BPP) as u64)
             .min(MAX_BITRATE as u64) as u32;
         // The floor must never exceed the ceiling (a tiny stream, or a
         // `--bitrate` cap below the floor), or the clamps panic.
@@ -1252,6 +1260,24 @@ mod tests {
         let _ = down;
         assert!(ladder.rung().fps <= 10, "did not step back down");
         assert!(ladder.hold_up > HOLD_UP, "hold_up did not double on a flap");
+    }
+
+    #[test]
+    fn full_chroma_can_return_after_a_drop_to_single420() {
+        // Dual420 at 60 fps drops to Single420 on a slow link. On a link
+        // that recovers, the target may only grow to the controller's
+        // ceiling, which must still pay for stepping back up to Dual420.
+        let pixels = 2560 * 1600;
+        let mut ctl = RateController::new(pixels, 2, 60, None);
+        ctl.reconfigure(pixels, 1, 60);
+        let ceiling = ctl.effective_max() as f64;
+        let up = Ladder::select(ceiling, pixels, true, true, 60, 1.25 * QUALITY_BPP);
+        assert!(
+            up.aux,
+            "the single-stream ceiling cannot buy back Dual420: {up:?}"
+        );
+        // The per-stream bitrate still divides by the active streams.
+        assert_eq!(ctl.stream_bitrate(), ctl.target());
     }
 
     #[test]
