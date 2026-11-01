@@ -86,6 +86,11 @@ struct Cli {
     /// to make the adaptive controller oscillate.
     #[arg(long)]
     fixed_bitrate: Option<u32>,
+    /// Bits per pixel per frame (per stream) the frame rate is chosen for:
+    /// the stream runs at the highest frame rate the link pays for at this
+    /// quality, up to the output's refresh. Higher is sharper and slower.
+    #[arg(long, default_value_t = rate::QUALITY_BPP)]
+    quality_bpp: f64,
 }
 
 fn main() -> Result<()> {
@@ -121,6 +126,7 @@ fn main() -> Result<()> {
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),
         max_fps: cli.max_fps.filter(|hz| *hz > 0),
         fixed_bitrate: cli.fixed_bitrate.filter(|bps| *bps > 0),
+        quality_bpp: cli.quality_bpp,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

@@ -304,89 +304,59 @@ pub enum Reason {
     Rate,
 }
 
-/// One quality level: what the stream gives up when the link cannot pay
-/// for full quality.
-pub struct Level {
-    /// Frame-rate ceiling as a share of the session's refresh rate, so a
-    /// 240 Hz screen degrades 240 -> 120 -> 60 instead of dropping straight
-    /// to 30.
-    pub fps_share: f32,
-    /// The lowest frame rate the share may fall to on a slow output.
-    pub fps_floor: u32,
-    /// Keep the auxiliary chroma stream (Dual420) when the client has it.
+/// What the stream gives up when the link cannot pay for full quality.
+/// Resolution is never given up: the stream is always the client window's
+/// size. Frame rate degrades first, continuously, because the pointer is
+/// local and a sharp still picture matters more on a desktop than motion;
+/// then the chroma detail (Dual420 -> Single420 costs only coloured
+/// fringes), then frame rate again down to the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rung {
+    /// Keep the negotiated chroma (both streams of Dual420) when the client
+    /// has it; false drops to Single420.
     pub aux: bool,
-    /// Stream resolution as a share of the full-quality fit size.
-    pub scale: f32,
+    /// Frame-rate ceiling, up to the session's refresh rate.
+    pub fps: u32,
 }
 
-impl Level {
+impl Rung {
+    /// Strictly better: the chroma detail first, then the frame rate.
+    fn better_than(&self, other: &Rung) -> bool {
+        (self.aux, self.fps) > (other.aux, other.fps)
+    }
+
+    /// Different enough to be worth a move: a chroma change, or a frame
+    /// rate at least `FPS_STEP` away, so the cadence does not wander with
+    /// every rate sample.
+    fn differs(&self, other: &Rung) -> bool {
+        let (a, b) = (self.fps as f64, other.fps as f64);
+        self.aux != other.aux || (a - b).abs() >= FPS_STEP * a.max(b)
+    }
+
     /// This rung's frame-rate ceiling for an output refreshing at `max_fps`.
     pub fn fps(&self, max_fps: u32) -> u32 {
-        let max_fps = max_fps.max(1);
-        let share = (max_fps as f32 * self.fps_share).round() as u32;
-        share.clamp(self.fps_floor.min(max_fps), max_fps).max(1)
+        self.fps.min(max_fps).max(1)
     }
 }
 
-/// Frame rate degrades first, because the pointer is local and a sharp
-/// still picture matters more on a desktop than motion; then the chroma
-/// detail (Dual420 -> Single420 costs only coloured fringes); resolution
-/// last, because it is the most visible loss on text. The fps floors are
-/// policy: never below 15 before chroma is given up, never below 10 before
-/// resolution, 5 is the absolute floor. At 60 Hz these rungs are exactly
-/// 60, 30, 15, 15, 10, 10, 5 fps.
-pub const LEVELS: [Level; 7] = [
-    Level {
-        fps_share: 1.0,
-        fps_floor: 1,
-        aux: true,
-        scale: 1.0,
-    },
-    Level {
-        fps_share: 0.5,
-        fps_floor: 15,
-        aux: true,
-        scale: 1.0,
-    },
-    Level {
-        fps_share: 0.25,
-        fps_floor: 15,
-        aux: true,
-        scale: 1.0,
-    },
-    Level {
-        fps_share: 0.25,
-        fps_floor: 15,
-        aux: false,
-        scale: 1.0,
-    },
-    Level {
-        fps_share: 0.125,
-        fps_floor: 10,
-        aux: false,
-        scale: 1.0,
-    },
-    Level {
-        fps_share: 0.125,
-        fps_floor: 10,
-        aux: false,
-        scale: 0.5,
-    },
-    Level {
-        fps_share: 0.0,
-        fps_floor: 5,
-        aux: false,
-        scale: 0.5,
-    },
-];
+/// Per-stream bits per pixel per frame the ladder aims for. Sharp desktop
+/// text wants ~0.1; the frame rate is whatever the link pays for at this.
+pub const QUALITY_BPP: f64 = 0.08;
+/// The frame rate is not given below this before the chroma detail is.
+const AUX_MIN_FPS: u32 = 30;
+/// The absolute frame-rate floor.
+const MIN_FPS: u32 = 5;
+/// A frame-rate move smaller than this share of the rate is not made.
+const FPS_STEP: f64 = 0.15;
 
-/// Picks the quality level the measured rate can pay for, with hysteresis:
-/// step down after a short hold, step up only after `hold_up`, which
-/// doubles when an up-step flaps back down. During slow start, upward
-/// moves use the first measured capacity while downward moves wait for
-/// confirmed congestion.
+/// Picks the rung the measured rate can pay for, with hysteresis: step down
+/// after a short hold, step up only after `hold_up`, which doubles when an
+/// up-step flaps back down. During slow start, upward moves use the first
+/// measured capacity while downward moves wait for confirmed congestion.
 pub struct Ladder {
-    index: usize,
+    rung: Rung,
+    /// Per-stream bits per pixel the frame rate is chosen for.
+    quality_bpp: f64,
     hold_up: Duration,
     below_since: Option<Instant>,
     last_change: Option<Instant>,
@@ -399,9 +369,18 @@ const MAX_HOLD_UP: Duration = Duration::from_secs(300);
 const DOWN_FLOOR_MULT: f64 = 0.9;
 
 impl Ladder {
-    pub fn new(start: usize) -> Self {
+    /// Start at `start_fps` with full chroma, aiming for `quality_bpp`.
+    pub fn new(start_fps: u32, quality_bpp: f64) -> Self {
         Self {
-            index: start.min(LEVELS.len() - 1),
+            rung: Rung {
+                aux: true,
+                fps: start_fps.max(MIN_FPS),
+            },
+            quality_bpp: if quality_bpp.is_finite() && quality_bpp > 0.0 {
+                quality_bpp
+            } else {
+                QUALITY_BPP
+            },
             hold_up: HOLD_UP,
             below_since: None,
             last_change: None,
@@ -409,56 +388,45 @@ impl Ladder {
         }
     }
 
-    pub fn level(&self) -> &'static Level {
-        &LEVELS[self.index]
+    pub fn rung(&self) -> Rung {
+        self.rung
     }
 
-    pub fn index(&self) -> usize {
-        self.index
+    /// The frame rate `rate_bps` pays for at `bpp` per stream, when each
+    /// frame is `streams` streams of `pixels`.
+    fn affordable_fps(rate_bps: f64, pixels: u64, streams: f64, bpp: f64) -> u32 {
+        let fps = 0.85 * rate_bps / (streams * pixels.max(1) as f64 * bpp);
+        fps.clamp(0.0, u32::MAX as f64) as u32
     }
 
-    /// Bits per pixel one stream gets at `level` when the link delivers
-    /// `rate_bps` and the full-quality fit size is `pixels` at `max_fps`.
-    /// A rung that would drop the auxiliary stream still pays for two when
-    /// the client cannot decode Single420 (`can_drop_aux` false).
-    fn affordable_bpp(
-        rate_bps: f64,
-        pixels: u64,
-        dual: bool,
-        can_drop_aux: bool,
-        max_fps: u32,
-        level: &Level,
-    ) -> f64 {
-        let streams = if dual && (level.aux || !can_drop_aux) {
-            2.0
-        } else {
-            1.0
-        };
-        let fps = level.fps(max_fps).max(1) as f64;
-        let px = (pixels as f64 * level.scale as f64 * level.scale as f64).max(1.0);
-        0.85 * rate_bps / (streams * fps * px)
-    }
-
-    /// The lowest (best) level whose per-stream budget stays at or above
-    /// `floor_mult` x FLOOR_BPP; the last level when none does.
+    /// The best rung `rate_bps` pays for at `floor_mult` x the quality bpp.
+    /// A Single420 base, or a client that cannot decode Single420
+    /// (`can_drop_aux` false), keeps its chroma and only trades frame rate.
     fn select(
         rate_bps: f64,
         pixels: u64,
         dual: bool,
         can_drop_aux: bool,
         max_fps: u32,
-        floor_mult: f64,
-    ) -> usize {
-        LEVELS
-            .iter()
-            .position(|l| {
-                Self::affordable_bpp(rate_bps, pixels, dual, can_drop_aux, max_fps, l)
-                    >= floor_mult * FLOOR_BPP
-            })
-            .unwrap_or(LEVELS.len() - 1)
+        bpp: f64,
+    ) -> Rung {
+        let max_fps = max_fps.max(1);
+        let floor = MIN_FPS.min(max_fps);
+        let streams = if dual { 2.0 } else { 1.0 };
+        let full = Self::affordable_fps(rate_bps, pixels, streams, bpp);
+        if !dual || !can_drop_aux || full >= AUX_MIN_FPS.min(max_fps) {
+            return Rung {
+                aux: true,
+                fps: full.clamp(floor, max_fps),
+            };
+        }
+        Rung {
+            aux: false,
+            fps: Self::affordable_fps(rate_bps, pixels, 1.0, bpp).clamp(floor, max_fps),
+        }
     }
 
-    /// Consider a move. Returns the new index when the level changed.
+    /// Consider a move. Returns the new rung when it changed.
     #[allow(clippy::too_many_arguments)]
     pub fn consider(
         &mut self,
@@ -470,35 +438,54 @@ impl Ladder {
         dual: bool,
         can_drop_aux: bool,
         max_fps: u32,
-    ) -> Option<usize> {
+    ) -> Option<Rung> {
         let rate = link.rate_max_bps(now)?;
         // Down-moves need real (not app-limited) evidence: a static screen's
         // refinement trickle must not read as a slow link.
         let real = link.rate_recent_bps(now).is_some();
-        let sel = Self::select(rate, pixels, dual, can_drop_aux, max_fps, 1.0);
-        let down = Self::select(rate, pixels, dual, can_drop_aux, max_fps, DOWN_FLOOR_MULT);
+        let at = |mult: f64| {
+            Self::select(
+                rate,
+                pixels,
+                dual,
+                can_drop_aux,
+                max_fps,
+                mult * self.quality_bpp,
+            )
+        };
+        let sel = at(1.0);
+        let down = at(DOWN_FLOOR_MULT);
+        // A lower refresh (the window moved to a slower monitor) lowers the
+        // ceiling at once; it is not a link problem.
+        let current = Rung {
+            fps: self.rung.fps(max_fps),
+            ..self.rung
+        };
+        let worse = current.better_than(&down) && current.differs(&down);
 
         if slow_start {
-            if sel < self.index || (down > self.index && real && recent_congestion) {
+            if (sel.better_than(&current) && sel.differs(&current))
+                || (worse && real && recent_congestion)
+            {
                 self.move_to(now, sel);
                 return Some(sel);
             }
             return None;
         }
 
-        if sel < self.index {
+        if sel.better_than(&current) && sel.differs(&current) {
             self.below_since = None;
-            // Step up needs headroom (1.25x the floor) and a full hold.
-            let up = Self::select(rate, pixels, dual, can_drop_aux, max_fps, 1.25);
+            // Step up needs headroom (1.25x the quality) and a full hold.
+            let up = at(1.25);
             let held = self
                 .last_change
                 .is_none_or(|t| now.duration_since(t) >= self.hold_up);
-            if up < self.index && held {
+            if up.better_than(&current) && up.differs(&current) && held {
                 self.last_step_up = Some(now);
                 self.move_to(now, up);
                 return Some(up);
             }
-        } else if down > self.index && real {
+        } else if worse && real {
             let since = *self.below_since.get_or_insert(now);
             if recent_congestion || now.duration_since(since) >= HOLD_DOWN {
                 // An up-step that flaps straight back down halves how often
@@ -518,8 +505,8 @@ impl Ladder {
         None
     }
 
-    fn move_to(&mut self, now: Instant, index: usize) {
-        self.index = index;
+    fn move_to(&mut self, now: Instant, rung: Rung) {
+        self.rung = rung;
         self.last_change = Some(now);
         self.below_since = None;
     }
@@ -560,6 +547,9 @@ pub struct RateController {
 }
 
 pub const MAX_BPP: f64 = 0.1;
+/// A sanity bound on the target, not a policy limit: a wired link is let
+/// pay for a high-refresh window at full quality.
+const MAX_BITRATE: u32 = 250_000_000;
 pub const MIN_BPP: f64 = 0.005;
 pub const FLOOR_BPP: f64 = 0.03;
 const INITIAL_BPS: u32 = 3_000_000;
@@ -598,7 +588,7 @@ impl RateController {
         self.pixels = pixels;
         self.streams = streams.max(1);
         self.max = ((pixels as f64 * streams.max(1) as f64 * max_fps as f64 * MAX_BPP) as u64)
-            .min(80_000_000) as u32;
+            .min(MAX_BITRATE as u64) as u32;
         // The floor must never exceed the ceiling (a tiny stream, or a
         // `--bitrate` cap below the floor), or the clamps panic.
         self.min = (((pixels as f64 * MIN_BPP * 5.0) as u64).max(100_000) as u32)
@@ -878,7 +868,7 @@ mod tests {
         pixels: u64,
         streams: u32,
         max_fps: u32,
-        level_changes: Vec<(Instant, usize)>,
+        rung_changes: Vec<(Instant, Rung)>,
         now: Instant,
         frame_id: u64,
         pending_acks: VecDeque<(Instant, u64)>,
@@ -889,11 +879,11 @@ mod tests {
             Self {
                 link: LinkEstimator::new(),
                 ctl: RateController::new(pixels, streams, max_fps, None),
-                ladder: Ladder::new(1),
+                ladder: Ladder::new(30, QUALITY_BPP),
                 pixels,
                 streams,
                 max_fps,
-                level_changes: Vec::new(),
+                rung_changes: Vec::new(),
                 now: Instant::now(),
                 frame_id: 0,
                 pending_acks: VecDeque::new(),
@@ -920,7 +910,7 @@ mod tests {
                     let (_, id) = self.pending_acks.pop_front().unwrap();
                     self.link.on_ack(self.now, id);
                     self.ctl.on_ack(self.now, &mut self.link);
-                    if let Some(level) = self.ladder.consider(
+                    if let Some(rung) = self.ladder.consider(
                         self.now,
                         &self.link,
                         self.ctl.is_slow_start(),
@@ -930,7 +920,7 @@ mod tests {
                         true,
                         self.max_fps,
                     ) {
-                        self.level_changes.push((self.now, level));
+                        self.rung_changes.push((self.now, rung));
                     }
                     if fps == 0 && self.link.inflight_bytes() == 0 {
                         self.ctl.note_idle(self.now);
@@ -1070,17 +1060,15 @@ mod tests {
         let pixels = 2560 * 1440;
         let mut active = Sim::new(pixels, 2, 60);
         active.run(1.0, 30, 70.0, 40e6);
-        assert_eq!(
-            Ladder::select(
-                active.link.rate_max_bps(active.now).unwrap(),
-                pixels,
-                true,
-                true,
-                60,
-                1.0,
-            ),
-            0
+        let rung = Ladder::select(
+            active.link.rate_max_bps(active.now).unwrap(),
+            pixels,
+            true,
+            true,
+            60,
+            QUALITY_BPP,
         );
+        assert!(rung.aux && rung.fps >= 30, "{rung:?}");
 
         let mut sim = Sim::new(pixels, 2, 60);
         sim.run(0.001, 30, 70.0, 40e6);
@@ -1094,15 +1082,15 @@ mod tests {
             "target {}",
             sim.ctl.target()
         );
-        assert_eq!(sim.ladder.index(), 0);
-        assert!(sim.level_changes.iter().all(|(_, level)| *level < 2));
+        assert!(sim.ladder.rung().aux, "{:?}", sim.ladder.rung());
+        assert!(sim.rung_changes.iter().all(|(_, rung)| rung.aux));
     }
 
     #[test]
     fn a_slow_link_still_moves_down_during_startup() {
         let mut sim = Sim::new(2560 * 1440, 2, 60);
         sim.run(8.0, 30, 70.0, 2.5e6);
-        assert!(sim.ladder.index() >= 2, "level {}", sim.ladder.index());
+        assert!(!sim.ladder.rung().aux, "{:?}", sim.ladder.rung());
         assert!(sim.ctl.target() < 4_000_000, "target {}", sim.ctl.target());
     }
 
@@ -1110,9 +1098,9 @@ mod tests {
     fn a_capacity_drop_moves_the_ladder_down() {
         let mut sim = Sim::new(2560 * 1440, 2, 60);
         sim.run(6.0, 30, 70.0, 40e6);
-        assert_eq!(sim.ladder.index(), 0);
+        assert!(sim.ladder.rung().aux, "{:?}", sim.ladder.rung());
         sim.run(8.0, 30, 70.0, 2.5e6);
-        assert!(sim.ladder.index() >= 2, "level {}", sim.ladder.index());
+        assert!(!sim.ladder.rung().aux, "{:?}", sim.ladder.rung());
         assert!(sim.ctl.target() < 4_000_000, "target {}", sim.ctl.target());
     }
 
@@ -1166,45 +1154,91 @@ mod tests {
         (link, now)
     }
 
+    fn rung(aux: bool, fps: u32) -> Rung {
+        Rung { aux, fps }
+    }
+
     #[test]
     fn ladder_selects_by_rate() {
+        const QHD: u64 = 2560 * 1440;
         let cases = [
-            // (rate, pixels, dual, expected level)
-            (50e6, 1920 * 1080, true, 0),  // lan: full quality
-            (20e6, 1920 * 1080, true, 0),  // dsl still affords 60 fps dual
-            (2.5e6, 2560 * 1440, true, 3), // satellite: 15 fps single, full res
-            (0.3e6, 2560 * 1440, true, 6), // worse than the ladder: last level
+            // (rate, pixels, dual, max_fps, expected)
+            (50e6, 1920 * 1080, true, 60, rung(true, 60)), // lan: full quality
+            (20e6, 1920 * 1080, true, 60, rung(true, 51)), // dsl: fps between the old rungs
+            (200e6, QHD, true, 240, rung(true, 240)),      // wired: the panel's refresh
+            (45e6, QHD, true, 240, rung(true, 64)),        // wi-fi: fps the link pays for
+            (2.5e6, QHD, true, 60, rung(false, 7)),        // satellite: single, full res
+            (0.3e6, QHD, true, 60, rung(false, 5)),        // worse than the ladder: floor
+            (2.5e6, QHD, false, 60, rung(true, 7)),        // a Single420 base trades fps only
         ];
-        for (rate, pixels, dual, expected) in cases {
-            let got = Ladder::select(rate, pixels, dual, true, 60, 1.0);
+        for (rate, pixels, dual, max_fps, expected) in cases {
+            let got = Ladder::select(rate, pixels, dual, true, max_fps, QUALITY_BPP);
             assert_eq!(got, expected, "rate {rate} pixels {pixels}");
         }
     }
 
     #[test]
+    fn a_higher_quality_bar_lowers_the_frame_rate() {
+        let pixels = 2560 * 1600;
+        let sharp = Ladder::select(90e6, pixels, true, true, 240, 2.0 * QUALITY_BPP);
+        let fast = Ladder::select(90e6, pixels, true, true, 240, QUALITY_BPP);
+        assert!(sharp.aux && fast.aux);
+        assert!(sharp.fps * 2 <= fast.fps + 1, "{sharp:?} vs {fast:?}");
+    }
+
+    #[test]
     fn a_dual_only_client_pays_for_two_streams_on_every_rung() {
         // The client decodes only Dual420: rungs cannot drop the aux
-        // stream, so the satellite rate must buy a deeper rung (lower fps
-        // or resolution) instead of an undecodable Single420 one.
-        let sel = Ladder::select(2.5e6, 2560 * 1440, true, false, 60, 1.0);
-        assert_eq!(sel, 5, "expected the half-resolution rung, got {sel}");
+        // stream, so the satellite rate buys a lower frame rate instead of
+        // an undecodable Single420 rung.
+        let sel = Ladder::select(2.5e6, 2560 * 1440, true, false, 60, QUALITY_BPP);
+        assert_eq!(sel, rung(true, 5));
+    }
+
+    #[test]
+    fn small_rate_changes_do_not_move_the_frame_rate() {
+        let pixels = 2560 * 1440;
+        let (link, now) = link_at(40e6);
+        let mut ladder = Ladder::new(30, QUALITY_BPP);
+        let first = ladder.consider(now, &link, true, false, pixels, true, true, 240);
+        assert!(first.is_some());
+        // A few percent more: within FPS_STEP, no move however long held.
+        let (link, later) = link_at(42e6);
+        let later = later.max(now) + 10 * HOLD_UP;
+        assert_eq!(
+            ladder.consider(later, &link, false, false, pixels, true, true, 240),
+            None
+        );
+    }
+
+    #[test]
+    fn a_slower_monitor_lowers_the_ceiling_without_a_step() {
+        let (link, now) = link_at(200e6);
+        let mut ladder = Ladder::new(30, QUALITY_BPP);
+        let up = ladder.consider(now, &link, true, false, 1920 * 1080, true, true, 240);
+        assert_eq!(up, Some(rung(true, 240)));
+        // The window moves to a 60 Hz monitor: the rung's fps is capped
+        // there, and a fast link is no reason to move.
+        assert_eq!(ladder.rung().fps(60), 60);
+        assert_eq!(
+            ladder.consider(now, &link, false, false, 1920 * 1080, true, true, 60),
+            None
+        );
     }
 
     #[test]
     fn startup_downshift_waits_for_congestion() {
         let (link, now) = link_at(2.5e6);
-        let mut ladder = Ladder::new(1);
+        let mut ladder = Ladder::new(30, QUALITY_BPP);
         let moved = ladder.consider(now, &link, true, false, 2560 * 1440, true, true, 60);
         assert_eq!(moved, None);
-        assert_eq!(
-            ladder.consider(now, &link, true, true, 2560 * 1440, true, true, 60),
-            Some(3)
-        );
+        let moved = ladder.consider(now, &link, true, true, 2560 * 1440, true, true, 60);
+        assert!(moved.is_some_and(|r| !r.aux), "{moved:?}");
         let (link, now) = link_at(50e6);
-        let mut ladder = Ladder::new(1);
+        let mut ladder = Ladder::new(30, QUALITY_BPP);
         assert_eq!(
             ladder.consider(now, &link, true, false, 1920 * 1080, true, true, 60),
-            Some(0)
+            Some(rung(true, 60))
         );
     }
 
@@ -1212,12 +1246,13 @@ mod tests {
     fn a_flap_doubles_the_up_hold() {
         let pixels = 2560 * 1440;
         let (link, mut now) = link_at(2.5e6);
-        let mut ladder = Ladder::new(3);
+        let mut ladder = Ladder::new(30, QUALITY_BPP);
+        ladder.rung = rung(false, 15);
         // Probe up succeeds after the hold on a briefly-better link...
         let (good, good_now) = link_at(8e6);
         now = now.max(good_now) + HOLD_UP;
         let up = ladder.consider(now, &good, false, false, pixels, true, true, 60);
-        assert!(up.is_some_and(|i| i < 3), "no step up: {up:?}");
+        assert!(up.is_some_and(|r| r.fps > 15), "no step up: {up:?}");
         // ...then the link is what it was; after HOLD_DOWN it steps back.
         now += HOLD_DOWN;
         let down = ladder.consider(now, &link, false, false, pixels, true, true, 60);
@@ -1230,13 +1265,13 @@ mod tests {
             link2.on_sent(t, id, bytes, false);
             t += Duration::from_millis(400);
             link2.on_ack(t, id);
-            if ladder.index() >= 3 {
+            if ladder.rung().fps <= 10 {
                 break;
             }
             ladder.consider(t, &link2, false, false, pixels, true, true, 60);
         }
         let _ = down;
-        assert!(ladder.index() >= 3, "did not step back down");
+        assert!(ladder.rung().fps <= 10, "did not step back down");
         assert!(ladder.hold_up > HOLD_UP, "hold_up did not double on a flap");
     }
 

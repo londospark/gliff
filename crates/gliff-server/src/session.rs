@@ -51,6 +51,8 @@ pub struct Config {
     pub max_fps: Option<u32>,
     /// Hold this bitrate instead of adapting (see [`RateController::pin`]).
     pub fixed_bitrate: Option<u32>,
+    /// Per-stream bits per pixel the ladder picks the frame rate for.
+    pub quality_bpp: f64,
 }
 
 /// Events from the capture thread.
@@ -134,11 +136,11 @@ where
             features: features(),
         })
         .await?;
-    let ladder = Ladder::new(START_LEVEL);
+    let ladder = Ladder::new(START_FPS, cfg.quality_bpp);
     // The output's own refresh rate is the cadence ceiling: a 240 Hz virtual
     // screen is streamed at up to 240 fps, not a fixed 60.
     let max_fps = capped_fps(output.refresh_hz, cfg.max_fps);
-    let start_fps = ladder.level().fps(max_fps);
+    let start_fps = ladder.rung().fps(max_fps);
     let fps_cmd = start_fps;
     let on_gpu = matches!(video, VideoTier::Gpu(_));
     let started = match VideoStart::open(video, &cfg, &caps, &output, fps_cmd, max_fps) {
@@ -497,16 +499,16 @@ struct Session {
     next_refine_at: Instant,
     /// The one-shot first-frame recapture has fired.
     recaptured: bool,
-    /// Quality levels the link rate picks from: fps first, then chroma,
-    /// then resolution.
+    /// The quality the link rate pays for: fps first, then chroma, never
+    /// resolution.
     ladder: Ladder,
     /// The full-quality fit size (the client's view); the active stream is
-    /// this scaled by the ladder level.
+    /// always this size.
     base_stream: (u32, u32),
-    /// The chroma the handshake negotiated; a ladder level may reduce the
+    /// The chroma the handshake negotiated; a ladder rung may reduce the
     /// active `chroma` to Single420.
     base_chroma: ChromaMode,
-    /// The fps cap in the last StreamConfig, so a pace-only level change
+    /// The fps cap in the last StreamConfig, so a pace-only ladder step
     /// still reaches the client.
     sent_fps_cap: u32,
     cursor_shape_id: u32,
@@ -522,9 +524,9 @@ const REFINE_EVERY: Duration = Duration::from_millis(200);
 /// A static screen produces no damage and so no first frame; after this
 /// long the capture is torn down and retried once with full damage.
 const FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(700);
-/// The starting ladder level: 30 fps, full quality. It halves the first
-/// burst against level 0 while the controller measures available capacity.
-const START_LEVEL: usize = 1;
+/// The starting frame rate, at full quality. It holds the first burst down
+/// while the controller measures available capacity.
+const START_FPS: u32 = 30;
 
 impl Session {
     async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
@@ -556,7 +558,7 @@ impl Session {
                 let dual = self.base_chroma == ChromaMode::Dual420;
                 let can_drop_aux = self.can_drop_aux();
                 let pixels = self.base_stream.0 as u64 * self.base_stream.1 as u64;
-                if let Some(level) = self.ladder.consider(
+                if let Some(rung) = self.ladder.consider(
                     now,
                     &self.link,
                     self.ctl.is_slow_start(),
@@ -567,7 +569,7 @@ impl Session {
                     self.max_fps,
                 ) {
                     tracing::info!(
-                        level,
+                        aux = rung.aux,
                         fps_cap = self.fps_cap(),
                         rate_mbit = self
                             .link
@@ -983,9 +985,9 @@ impl Session {
             && self.link_has_room()
     }
 
-    /// The ladder level's frame-rate ceiling, bounded by the session's.
+    /// The ladder rung's frame-rate ceiling, bounded by the session's.
     fn fps_cap(&self) -> u32 {
-        self.ladder.level().fps(self.max_fps)
+        self.ladder.rung().fps(self.max_fps)
     }
 
     /// A rung may only drop the auxiliary stream when the client can
@@ -995,10 +997,10 @@ impl Session {
         self.caps.chroma.contains(&ChromaMode::Single420)
     }
 
-    /// The chroma the current ladder level allows, within what the client
+    /// The chroma the current ladder rung allows, within what the client
     /// advertised.
     fn active_chroma(&self) -> ChromaMode {
-        if self.ladder.level().aux || !self.can_drop_aux() {
+        if self.ladder.rung().aux || !self.can_drop_aux() {
             self.base_chroma
         } else {
             ChromaMode::Single420
@@ -1034,19 +1036,16 @@ impl Session {
     }
 
     /// The single choke point for stream geometry: derive the active stream
-    /// from the full-quality fit size (`base_stream`) and the ladder level.
+    /// from the full-quality fit size (`base_stream`) and the ladder rung.
     /// A change of size or chroma rebuilds the encoder; an fps-only change
     /// updates the rate without one. Returns false when the encoder
     /// rejected the geometry; the caller sends the StreamConfig on success.
     fn apply_stream_params(&mut self) -> Result<bool> {
         self.update_fps_cmd();
-        let level = self.ladder.level();
         let chroma = self.active_chroma();
-        let want = EncoderSettings::fit_extent(
-            ((self.base_stream.0 as f32 * level.scale) as u32).max(2) & !1,
-            ((self.base_stream.1 as f32 * level.scale) as u32).max(2) & !1,
-            self.encoder_max,
-        );
+        // The stream is always the full fit size: the ladder trades frame
+        // rate and chroma, never resolution.
+        let want = self.base_stream;
         if want == self.stream && chroma == self.chroma {
             self.apply_rate();
             return Ok(true);
@@ -1068,7 +1067,6 @@ impl Session {
                     height = want.1,
                     ?chroma,
                     fps_cap = self.fps_cap(),
-                    level = self.ladder.index(),
                     "stream reconfigured"
                 );
                 self.encoder = encoder;
@@ -1132,12 +1130,7 @@ impl Session {
         self.encoder_max = stream_limit(gliff_sw::Encoder::MAX_SIZE, &self.caps)?;
         self.base_stream =
             EncoderSettings::fit_extent(self.base_stream.0, self.base_stream.1, self.encoder_max);
-        let level = self.ladder.level();
-        self.stream = EncoderSettings::fit_extent(
-            ((self.base_stream.0 as f32 * level.scale) as u32).max(2) & !1,
-            ((self.base_stream.1 as f32 * level.scale) as u32).max(2) & !1,
-            self.encoder_max,
-        );
+        self.stream = self.base_stream;
         let streams = if self.chroma == ChromaMode::Dual420 {
             2
         } else {
