@@ -447,9 +447,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     });
     install_input_handlers(&ui, &video, &window, hotkey);
     install_resize_handler(&ui);
-    // Seed the refresh rate before the first connect, so a headless remote
-    // screen starts at this display's cadence rather than 60 Hz.
-    ui.monitor_refresh.set(window_refresh_hz().unwrap_or(0));
+    watch_monitor_refresh(&ui);
     install_address_bar(&ui, &connect_btn);
     refresh_tabs(&ui);
 
@@ -2184,15 +2182,48 @@ fn install_resize_handler(ui: &Rc<App>) {
         }
         glib::ControlFlow::Continue
     });
+}
 
-    // The window can move to another monitor without resizing. A headless
-    // remote screen follows the refresh rate of the display it is shown on,
-    // so re-send when that changes.
-    let refresh_ui = ui.clone();
-    glib::timeout_add_local(Duration::from_secs(1), move || {
-        let refresh = window_refresh_hz().unwrap_or(0);
-        if refresh_ui.monitor_refresh.replace(refresh) != refresh {
-            request_resize(&refresh_ui);
+/// A headless remote screen follows the refresh rate of the display the
+/// window is shown on, and the window can move to another monitor without
+/// resizing, so re-send the size when that rate changes. The Hyprland
+/// requests can block for seconds on a busy compositor, so they run on a
+/// worker and only the result reaches the GTK thread. `--max-fps` caps the
+/// rate sent, which also caps a `--connect` server.
+fn watch_monitor_refresh(ui: &Rc<App>) {
+    let (tx, rx) = channel::<Option<u32>>();
+    let spawned = std::thread::Builder::new()
+        .name("gliff-refresh".into())
+        .spawn(move || {
+            let mut last = None;
+            loop {
+                let hz = window_refresh_hz();
+                if last != Some(hz) {
+                    last = Some(hz);
+                    if tx.send(hz).is_err() {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "cannot watch the monitor refresh rate");
+        return;
+    }
+    let ui = ui.clone();
+    glib::timeout_add_local(Duration::from_millis(250), move || {
+        let Some(hz) = rx.try_iter().last() else {
+            return glib::ControlFlow::Continue;
+        };
+        let cap = ui.cli.max_fps;
+        let hz = match hz {
+            Some(hz) if cap > 0 => hz.min(cap),
+            Some(hz) => hz,
+            None => cap,
+        };
+        if ui.monitor_refresh.replace(hz) != hz {
+            request_resize(&ui);
         }
         glib::ControlFlow::Continue
     });

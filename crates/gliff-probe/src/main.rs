@@ -913,8 +913,11 @@ fn stream_bench(
         };
         milestone("stream_config");
         println!("  connected: headless={} output={} stream {w}x{h} {chroma:?}", session.headless, session.output);
-        if size.0 > 0 && size.1 > 0 {
-            writer.write_msg(&ClientMsg::Resize { width: size.0, height: size.1, scale: 1.0, refresh_hz: (refresh > 0).then_some(refresh) }).await?;
+        // A refresh alone resizes to the current stream size, so --refresh
+        // works without --width/--height.
+        let resize = if size.0 > 0 && size.1 > 0 { Some(size) } else if refresh > 0 { Some((w, h)) } else { None };
+        if let Some((rw, rh)) = resize {
+            writer.write_msg(&ClientMsg::Resize { width: rw, height: rh, scale: 1.0, refresh_hz: (refresh > 0).then_some(refresh) }).await?;
         }
         let gpu = match video {
             VideoMode::Gpu => Some(Gpu::open(Some(node))?),

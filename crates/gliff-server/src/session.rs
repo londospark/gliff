@@ -688,10 +688,11 @@ impl Session {
         let (width, height) = headless_target(width, height, scale);
         let (old_w, old_h) = (self.output.width, self.output.height);
         let old_hz = self.output.refresh_hz;
-        if let Some(hz) = refresh_hz.filter(|hz| *hz > 0) {
-            self.output.refresh_hz = capped_fps(hz, self.fps_cap_override);
-        }
-        let hz = self.output.refresh_hz;
+        // A client that cannot say keeps the current refresh; either way
+        // --max-fps applies, including to the mode the output was created at.
+        let requested_hz = refresh_hz.filter(|hz| *hz > 0).unwrap_or(old_hz);
+        let hz = capped_fps(requested_hz, self.fps_cap_override);
+        self.output.refresh_hz = hz;
         let same_size = (width, height) == (old_w, old_h);
         let same_scale = (scale - self.output.scale).abs() < 0.01;
         let same_hz = hz == old_hz;
@@ -1012,7 +1013,9 @@ impl Session {
     /// can sustain.
     fn update_fps_cmd(&mut self) {
         let sustainable = if self.encode_us > 0.0 {
-            (1e6 / (self.encode_us * 1.1)).clamp(5.0, self.max_fps as f64) as u32
+            // The floor is 5 fps unless the session's ceiling is lower.
+            let ceiling = self.max_fps as f64;
+            (1e6 / (self.encode_us * 1.1)).clamp(5.0_f64.min(ceiling), ceiling) as u32
         } else {
             self.max_fps
         };
@@ -1048,6 +1051,11 @@ impl Session {
         // rate and chroma, never resolution.
         let want = self.base_stream;
         if want == self.stream && chroma == self.chroma {
+            // The ceiling may have moved (a refresh-only resize): rebound the
+            // controller without rebuilding the encoder.
+            let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
+            self.ctl
+                .reconfigure(want.0 as u64 * want.1 as u64, streams, self.max_fps);
             self.apply_rate();
             return Ok(true);
         }
