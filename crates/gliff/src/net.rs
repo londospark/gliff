@@ -919,14 +919,23 @@ where
         }
         if last_report.elapsed().as_secs_f32() >= 1.0 {
             let secs = last_report.elapsed().as_secs_f32();
+            let stat_fps = frames_since as f32 / secs;
+            let stat_mbit = bytes_since as f32 * 8.0 / 1_000_000.0 / secs;
+            let stat_decode = if frames_since > 0 {
+                decode_ms_acc / frames_since as f32
+            } else {
+                0.0
+            };
+            tracing::debug!(
+                fps = stat_fps,
+                mbit = stat_mbit,
+                decode_ms = stat_decode,
+                "stream stats"
+            );
             let _ = status.send(Status::Stats {
-                fps: frames_since as f32 / secs,
-                mbit: bytes_since as f32 * 8.0 / 1_000_000.0 / secs,
-                decode_ms: if frames_since > 0 {
-                    decode_ms_acc / frames_since as f32
-                } else {
-                    0.0
-                },
+                fps: stat_fps,
+                mbit: stat_mbit,
+                decode_ms: stat_decode,
                 video: video_label.clone(),
             });
             frames_since = 0;

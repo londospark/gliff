@@ -36,11 +36,14 @@ struct Cli {
     #[arg(long, requires = "listen")]
     allow_remote: bool,
     /// Mirror an existing output: a name like `DP-1`, or `auto` for the
-    /// focused one (the default).
-    #[arg(long, conflicts_with = "headless")]
+    /// focused one (the default). With --headless, the named output is a
+    /// persistent virtual screen, created if it does not exist.
+    #[arg(long)]
     output: Option<String>,
-    /// Create a dedicated headless output sized and scaled to the client
-    /// window instead of mirroring.
+    /// Give the client a virtual output sized and scaled to its window
+    /// instead of mirroring. The virtual output is removed on disconnect
+    /// unless --output names it, which keeps it (and its workspaces) for
+    /// the next connection.
     #[arg(long)]
     headless: bool,
     /// Hyprland instance signature (default: newest).
@@ -73,6 +76,16 @@ struct Cli {
     /// GLIFF_CAPTURE environment variable.
     #[arg(long, value_parser = ["auto", "dmabuf", "shm"])]
     capture: Option<String>,
+    /// Cap the stream and the output's mode at this refresh rate (Hz)
+    /// instead of following the client's monitor. A lower cap puts more of
+    /// the link's bits into each frame, which is what sharp text needs.
+    #[arg(long)]
+    max_fps: Option<u32>,
+    /// Stream at exactly this bitrate (bits per second) instead of adapting
+    /// to the link. For a link with headroom whose queueing is noisy enough
+    /// to make the adaptive controller oscillate.
+    #[arg(long)]
+    fixed_bitrate: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -94,17 +107,20 @@ fn main() -> Result<()> {
     let render_node = hypr_capture::render_node_for_target(cli.render_node.as_deref(), &target);
     let cfg = session::Config {
         target,
-        output: if cli.headless {
+        output: if cli.headless && cli.output.is_none() {
             None
         } else {
             Some(cli.output.clone().unwrap_or_else(|| "auto".into()))
         },
+        headless: cli.headless,
         render_node,
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,
         video: gliff_sw::VideoMode::resolve(cli.video.as_deref()),
         full_chroma: cli.full_chroma,
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),
+        max_fps: cli.max_fps.filter(|hz| *hz > 0),
+        fixed_bitrate: cli.fixed_bitrate.filter(|bps| *bps > 0),
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

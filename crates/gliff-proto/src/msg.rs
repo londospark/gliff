@@ -194,6 +194,13 @@ pub enum ClientMsg {
         height: u32,
         #[n(2)]
         scale: f32,
+        /// Refresh rate of the monitor the client's window is on, in Hz, so
+        /// a headless output renders at the client's cadence; 0 when the
+        /// client could not read it. Clients older than this field omit it
+        /// and decode as 0.
+        #[n(3)]
+        #[cbor(default)]
+        refresh_hz: u32,
     },
     #[n(2)]
     Key {

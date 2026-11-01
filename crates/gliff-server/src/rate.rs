@@ -307,12 +307,25 @@ pub enum Reason {
 /// One quality level: what the stream gives up when the link cannot pay
 /// for full quality.
 pub struct Level {
-    /// Frame-rate ceiling; `u32::MAX` means the session maximum.
-    pub fps_cap: u32,
+    /// Frame-rate ceiling as a share of the session's refresh rate, so a
+    /// 240 Hz screen degrades 240 -> 120 -> 60 instead of dropping straight
+    /// to 30.
+    pub fps_share: f32,
+    /// The lowest frame rate the share may fall to on a slow output.
+    pub fps_floor: u32,
     /// Keep the auxiliary chroma stream (Dual420) when the client has it.
     pub aux: bool,
     /// Stream resolution as a share of the full-quality fit size.
     pub scale: f32,
+}
+
+impl Level {
+    /// This rung's frame-rate ceiling for an output refreshing at `max_fps`.
+    pub fn fps(&self, max_fps: u32) -> u32 {
+        let max_fps = max_fps.max(1);
+        let share = (max_fps as f32 * self.fps_share).round() as u32;
+        share.clamp(self.fps_floor.min(max_fps), max_fps).max(1)
+    }
 }
 
 /// Frame rate degrades first, because the pointer is local and a sharp
@@ -320,40 +333,48 @@ pub struct Level {
 /// detail (Dual420 -> Single420 costs only coloured fringes); resolution
 /// last, because it is the most visible loss on text. The fps floors are
 /// policy: never below 15 before chroma is given up, never below 10 before
-/// resolution, 5 is the absolute floor.
+/// resolution, 5 is the absolute floor. At 60 Hz these rungs are exactly
+/// 60, 30, 15, 15, 10, 10, 5 fps.
 pub const LEVELS: [Level; 7] = [
     Level {
-        fps_cap: u32::MAX,
+        fps_share: 1.0,
+        fps_floor: 1,
         aux: true,
         scale: 1.0,
     },
     Level {
-        fps_cap: 30,
+        fps_share: 0.5,
+        fps_floor: 15,
         aux: true,
         scale: 1.0,
     },
     Level {
-        fps_cap: 15,
+        fps_share: 0.25,
+        fps_floor: 15,
         aux: true,
         scale: 1.0,
     },
     Level {
-        fps_cap: 15,
+        fps_share: 0.25,
+        fps_floor: 15,
         aux: false,
         scale: 1.0,
     },
     Level {
-        fps_cap: 10,
+        fps_share: 0.125,
+        fps_floor: 10,
         aux: false,
         scale: 1.0,
     },
     Level {
-        fps_cap: 10,
+        fps_share: 0.125,
+        fps_floor: 10,
         aux: false,
         scale: 0.5,
     },
     Level {
-        fps_cap: 5,
+        fps_share: 0.0,
+        fps_floor: 5,
         aux: false,
         scale: 0.5,
     },
@@ -413,7 +434,7 @@ impl Ladder {
         } else {
             1.0
         };
-        let fps = level.fps_cap.min(max_fps).max(1) as f64;
+        let fps = level.fps(max_fps).max(1) as f64;
         let px = (pixels as f64 * level.scale as f64 * level.scale as f64).max(1.0);
         0.85 * rate_bps / (streams * fps * px)
     }
@@ -515,6 +536,8 @@ pub struct RateController {
     target: u32,
     /// Set by `--bitrate`: an upper cap the target never exceeds.
     fixed_cap: Option<u32>,
+    /// Set by `--fixed-bitrate`: hold `target` instead of adapting.
+    pinned: bool,
     slow_start: bool,
     started: Option<Instant>,
     startup_idle_since: Option<Instant>,
@@ -551,6 +574,7 @@ impl RateController {
             floor_bpf: 0,
             target: 0,
             fixed_cap,
+            pinned: false,
             slow_start: true,
             started: None,
             startup_idle_since: None,
@@ -595,7 +619,22 @@ impl RateController {
     /// the bounds and keep the same bits per second where possible.
     pub fn reconfigure(&mut self, pixels: u64, streams: u32, max_fps: u32) {
         self.set_bounds(pixels, streams, max_fps);
-        self.target = self.target.clamp(self.min, self.effective_max());
+        self.target = if self.pinned {
+            self.effective_max()
+        } else {
+            self.target.clamp(self.min, self.effective_max())
+        };
+    }
+
+    /// Hold one bitrate instead of adapting to the link. A noisy link (Wi-Fi
+    /// with a deep queue) makes the estimator see capacity collapse and
+    /// recover every second; the oscillation costs more quality than the
+    /// queueing it avoids. `--fixed-bitrate` picks the rate by hand.
+    pub fn pin(&mut self, bps: u32) {
+        self.fixed_cap = Some(bps);
+        self.pinned = true;
+        self.slow_start = false;
+        self.target = bps.clamp(self.min, self.effective_max());
     }
 
     pub fn target(&self) -> u32 {
@@ -668,6 +707,9 @@ impl RateController {
     /// Feed one ack. Returns the reason when the target changed.
     pub fn on_ack(&mut self, now: Instant, link: &mut LinkEstimator) -> Option<Reason> {
         self.got_ack = true;
+        if self.pinned {
+            return None;
+        }
         let started = *self.started.get_or_insert(now);
 
         if self.slow_start {

@@ -35,6 +35,9 @@ use crate::notify;
 pub struct Config {
     pub target: Target,
     pub output: Option<String>,
+    /// The output is the client's own screen: create it if it is missing and
+    /// resize it to the client's window and refresh rate.
+    pub headless: bool,
     pub render_node: PathBuf,
     pub low_bandwidth: bool,
     pub bitrate: Option<u32>,
@@ -43,6 +46,11 @@ pub struct Config {
     pub full_chroma: bool,
     /// What the capture ring is made of; `Shm` implies the CPU tier.
     pub capture: CaptureMode,
+    /// Cap on the stream and virtual-output refresh, instead of the
+    /// client's monitor refresh.
+    pub max_fps: Option<u32>,
+    /// Hold this bitrate instead of adapting (see [`RateController::pin`]).
+    pub fixed_bitrate: Option<u32>,
 }
 
 /// Events from the capture thread.
@@ -127,14 +135,17 @@ where
         })
         .await?;
     let ladder = Ladder::new(START_LEVEL);
-    let start_fps = ladder.level().fps_cap.min(MAX_FPS);
+    // The output's own refresh rate is the cadence ceiling: a 240 Hz virtual
+    // screen is streamed at up to 240 fps, not a fixed 60.
+    let max_fps = capped_fps(output.refresh_hz, cfg.max_fps);
+    let start_fps = ladder.level().fps(max_fps);
     let fps_cmd = start_fps;
     let on_gpu = matches!(video, VideoTier::Gpu(_));
-    let started = match VideoStart::open(video, &cfg, &caps, &output, fps_cmd) {
+    let started = match VideoStart::open(video, &cfg, &caps, &output, fps_cmd, max_fps) {
         Ok(start) => Ok(start),
         Err(e) if on_gpu => {
             tracing::warn!(error = %format!("{e:#}"), "cannot start the GPU video pipeline; falling back to the CPU pipeline");
-            VideoStart::open(VideoTier::Cpu, &cfg, &caps, &output, fps_cmd)
+            VideoStart::open(VideoTier::Cpu, &cfg, &caps, &output, fps_cmd, max_fps)
         }
         Err(e) => Err(e),
     };
@@ -251,6 +262,8 @@ where
         frame_id: 0,
         want_keyframe: true,
         fps_cmd,
+        max_fps,
+        fps_cap_override: cfg.max_fps,
         encode_us: 0.0,
         next_send_at: Instant::now(),
         last_frame: None,
@@ -466,6 +479,11 @@ struct Session {
     /// The one commanded cadence: the pace timer and the encoder's
     /// programmed frame rate both use it.
     fps_cmd: u32,
+    /// The output's refresh rate in Hz: the session's frame-rate ceiling.
+    /// Follows the client's monitor for a virtual output, unless capped.
+    max_fps: u32,
+    /// `--max-fps`: cap the output mode and cadence below the client's.
+    fps_cap_override: Option<u32>,
     /// Smoothed encode time, for the sustainable-fps clamp.
     encode_us: f64,
     /// The pace slot for the next frame.
@@ -494,8 +512,9 @@ struct Session {
     cursor_shape_id: u32,
 }
 
-/// The session-wide fps ceiling; ladder levels cap below it.
-const MAX_FPS: u32 = 60;
+/// The highest refresh rate a session will pace to, whatever an output
+/// reports: a bound on nonsense values, not a policy limit.
+const MAX_FPS_LIMIT: u32 = 480;
 /// Still-picture refinement: at most this many re-encodes of an unchanged
 /// frame, at least this far apart.
 const MAX_REFINES: u8 = 8;
@@ -545,7 +564,7 @@ impl Session {
                     pixels,
                     dual,
                     can_drop_aux,
-                    MAX_FPS,
+                    self.max_fps,
                 ) {
                     tracing::info!(
                         level,
@@ -600,7 +619,8 @@ impl Session {
                 width,
                 height,
                 scale,
-            } => self.resize(width, height, scale).await?,
+                refresh_hz,
+            } => self.resize(width, height, scale, refresh_hz).await?,
             ClientMsg::Ping { t } => self.writer.send(
                 ServerMsg::Pong {
                     t,
@@ -645,8 +665,9 @@ impl Session {
     /// Resize a headless output to the client's window at the client's
     /// scale, so the remote UI renders at the client's DPI, within the size
     /// it declared in Hello and the server's cap, and restart the encoder
-    /// at the new size.
-    async fn resize(&mut self, width: u32, height: u32, scale: f32) -> Result<()> {
+    /// at the new size. The output also takes the refresh rate of the
+    /// client's monitor, so its compositor renders at the client's cadence.
+    async fn resize(&mut self, width: u32, height: u32, scale: f32, refresh_hz: u32) -> Result<()> {
         let width = width.min(self.caps.max_width) & !1;
         let height = height.min(self.caps.max_height) & !1;
         let scale = if scale.is_finite() {
@@ -662,22 +683,32 @@ impl Session {
             return self.fit_mirror(width, height);
         }
         let (width, height) = headless_target(width, height, scale);
-        let same_size = (width, height) == (self.output.width, self.output.height);
+        let (old_w, old_h) = (self.output.width, self.output.height);
+        let old_hz = self.output.refresh_hz;
+        if refresh_hz > 0 {
+            self.output.refresh_hz = capped_fps(refresh_hz, self.fps_cap_override);
+        }
+        let hz = self.output.refresh_hz;
+        let same_size = (width, height) == (old_w, old_h);
         let same_scale = (scale - self.output.scale).abs() < 0.01;
-        if same_size && same_scale {
+        let same_hz = hz == old_hz;
+        if same_size && same_scale && same_hz {
             return Ok(());
         }
-        tracing::info!(width, height, scale, "resizing headless output");
+        tracing::info!(width, height, scale, hz, "resizing headless output");
         if let Err(e) = self
             .instance
-            .set_monitor_mode(&self.output.name, width, height, 60, scale)
+            .set_monitor_mode(&self.output.name, width, height, hz, scale)
         {
             tracing::warn!(error = %e, "could not resize the headless output");
+            self.output.refresh_hz = old_hz;
             return Ok(());
         }
         // Hyprland applies the mode asynchronously and may round the scale
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
+        self.max_fps = hz;
+        tracing::debug!(request_hz = refresh_hz, old_hz, hz, "headless cadence");
         if !same_size {
             let base = EncoderSettings::fit_extent(width, height, self.encoder_max);
             if base != (width, height) {
@@ -688,7 +719,6 @@ impl Session {
                 );
             }
             let old_base = self.base_stream;
-            let (old_w, old_h) = (self.output.width, self.output.height);
             self.base_stream = base;
             self.output.width = width;
             self.output.height = height;
@@ -697,14 +727,19 @@ impl Session {
                 self.base_stream = old_base;
                 self.output.width = old_w;
                 self.output.height = old_h;
+                self.output.refresh_hz = old_hz;
+                self.max_fps = old_hz;
                 let s = self.output.scale;
                 self.instance
-                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
+                    .set_monitor_mode(&self.output.name, old_w, old_h, old_hz, s)
                     .ok();
                 self.wait_for_mode(old_w, old_h, s).await;
                 self.inject(self.output.logical_extent());
                 return Ok(());
             }
+        } else if !same_hz {
+            // Only the cadence changed: re-pace and tell the client.
+            self.apply_stream_params()?;
         }
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
@@ -950,7 +985,7 @@ impl Session {
 
     /// The ladder level's frame-rate ceiling, bounded by the session's.
     fn fps_cap(&self) -> u32 {
-        self.ladder.level().fps_cap.min(MAX_FPS)
+        self.ladder.level().fps(self.max_fps)
     }
 
     /// A rung may only drop the auxiliary stream when the client can
@@ -974,9 +1009,9 @@ impl Session {
     /// can sustain.
     fn update_fps_cmd(&mut self) {
         let sustainable = if self.encode_us > 0.0 {
-            (1e6 / (self.encode_us * 1.1)).clamp(5.0, MAX_FPS as f64) as u32
+            (1e6 / (self.encode_us * 1.1)).clamp(5.0, self.max_fps as f64) as u32
         } else {
-            MAX_FPS
+            self.max_fps
         };
         self.fps_cmd = self.fps_cap().min(sustainable).max(1);
     }
@@ -1018,7 +1053,7 @@ impl Session {
         }
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
         self.ctl
-            .reconfigure(want.0 as u64 * want.1 as u64, streams, MAX_FPS);
+            .reconfigure(want.0 as u64 * want.1 as u64, streams, self.max_fps);
         let settings = encoder_settings(
             want.0,
             want.1,
@@ -1111,7 +1146,7 @@ impl Session {
         self.ctl.reconfigure(
             self.stream.0 as u64 * self.stream.1 as u64,
             streams,
-            MAX_FPS,
+            self.max_fps,
         );
         self.settings = encoder_settings(
             self.stream.0,
@@ -1302,6 +1337,7 @@ impl VideoStart {
         caps: &ClientCaps,
         output: &SessionOutput,
         fps: u32,
+        max_fps: u32,
     ) -> Result<Self> {
         // The CPU tier defaults to one 4:2:0 stream: dual-stream 4:4:4
         // doubles the encode work, which the CPU pays for where the GPU
@@ -1326,12 +1362,15 @@ impl VideoStart {
             );
         }
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
-        let ctl = RateController::new(
+        let mut ctl = RateController::new(
             stream.0 as u64 * stream.1 as u64,
             streams,
-            MAX_FPS,
+            max_fps,
             cfg.bitrate,
         );
+        if let Some(bps) = cfg.fixed_bitrate {
+            ctl.pin(bps);
+        }
         let settings = encoder_settings(
             stream.0,
             stream.1,
@@ -1574,8 +1613,9 @@ impl<O, C, I> DerefMut for ServedOutput<O, C, I> {
     }
 }
 
-/// The output being served. A created headless output is removed on drop, on
-/// every exit path including a failure later in setup.
+/// The output being served. A created headless output is resized to the
+/// client's window; one the client only owns for this session is removed on
+/// drop, on every exit path including a failure later in setup.
 struct SessionOutput {
     name: String,
     /// Physical (captured) size.
@@ -1583,7 +1623,15 @@ struct SessionOutput {
     height: u32,
     /// Output scale; the logical size the pointer works in is size / scale.
     scale: f32,
+    /// The output's refresh rate in Hz: the ceiling the stream paces to.
+    refresh_hz: u32,
+    /// Some when the output is virtual (created by gliff, or a persistent
+    /// virtual output gliff was pointed at), so its mode follows the window.
     headless: Option<hypr_ipc::Instance>,
+    /// Remove the virtual output when the session ends. False for a
+    /// persistent one (`--headless --output NAME`), which keeps its
+    /// workspaces for the next connection.
+    remove_on_drop: bool,
     awake: Option<KeepAwake>,
 }
 
@@ -1607,8 +1655,10 @@ impl Drop for SessionOutput {
         // Join the poller before removing its output, so every in-flight
         // DPMS request finishes while we still own the monitor.
         drop(self.awake.take());
-        if let Some(instance) = &self.headless {
-            let _ = instance.remove_output(&self.name);
+        if self.remove_on_drop {
+            if let Some(instance) = &self.headless {
+                let _ = instance.remove_output(&self.name);
+            }
         }
     }
 }
@@ -1657,38 +1707,80 @@ fn encoder_settings(
     }
 }
 
-/// Pick the named output, or create a headless one sized to the client.
+/// A mirror of an existing output: the remote keeps its own mode, and the
+/// stream is fitted into the client's window.
+fn mirror_output(m: &hypr_ipc::Monitor) -> SessionOutput {
+    SessionOutput {
+        name: m.name.clone(),
+        width: if m.transform & 1 != 0 {
+            m.height
+        } else {
+            m.width
+        } & !1,
+        height: if m.transform & 1 != 0 {
+            m.width
+        } else {
+            m.height
+        } & !1,
+        scale: m.scale,
+        refresh_hz: refresh_hz(m.refresh_rate),
+        headless: None,
+        remove_on_drop: false,
+        awake: None,
+    }
+}
+
+/// Pick the named output, or create a virtual one sized to the client.
+/// `--headless` alone creates a private output that is removed on exit;
+/// `--headless --output NAME` adopts (or creates) a persistent virtual
+/// output, so the desktop on it survives reconnects and is resized to the
+/// window each time.
 fn setup_output(
     instance: &hypr_ipc::Instance,
     cfg: &Config,
     caps: &ClientCaps,
 ) -> Result<SessionOutput> {
-    if let Some(name) = &cfg.output {
+    if let Some(name) = cfg.output.as_deref().filter(|name| *name != "auto") {
+        let mons = instance.monitors()?;
+        if let Some(m) = mons.iter().find(|m| m.name == name) {
+            // Called with --headless, the named output is the client's
+            // virtual screen, so its mode follows the window. Without it,
+            // this is an ordinary mirror of a real monitor.
+            let mut output = mirror_output(m);
+            if cfg.headless {
+                output.headless = Some(instance.clone());
+                // A persistent virtual output idles between connections and
+                // may have been switched off; keep it on, as a created one is.
+                output.awake = Some(KeepAwake::start(instance.clone(), output.name.clone())?);
+            }
+            return Ok(output);
+        }
+        if !cfg.headless {
+            anyhow::bail!("no output {name}");
+        }
+        // A named virtual output that does not exist yet: with a real
+        // monitor attached, mirror it instead of adding an empty screen
+        // beside it. It is created below only for a headless compositor.
+        if let Some(m) = main_monitor(&mons).filter(|m| m.name != "FALLBACK") {
+            tracing::info!(output = %m.name, "no virtual output yet; mirroring the attached monitor");
+            return Ok(mirror_output(m));
+        }
+    } else if !cfg.headless {
+        let name = cfg.output.as_deref().unwrap_or("auto");
         let mons = instance.monitors()?;
         let m = if name == "auto" {
             main_monitor(&mons)
         } else {
-            mons.iter().find(|m| &m.name == name)
+            mons.iter().find(|m| m.name == name)
         }
         .with_context(|| format!("no output {name}"))?;
-        return Ok(SessionOutput {
-            name: m.name.clone(),
-            width: if m.transform & 1 != 0 {
-                m.height
-            } else {
-                m.width
-            } & !1,
-            height: if m.transform & 1 != 0 {
-                m.width
-            } else {
-                m.height
-            } & !1,
-            scale: m.scale,
-            headless: None,
-            awake: None,
-        });
+        return Ok(mirror_output(m));
     }
-    let requested = format!("gliff-{}", std::process::id());
+    let persistent = cfg.output.is_some();
+    let requested = cfg
+        .output
+        .clone()
+        .unwrap_or_else(|| format!("gliff-{}", std::process::id()));
     let (wait, timed_out) = match instance.create_headless_output(&requested) {
         Ok(()) => (Duration::from_secs(1), None),
         Err(e) if creation_may_complete(&e) => {
@@ -1704,7 +1796,11 @@ fn setup_output(
         width: 0,
         height: 0,
         scale: 1.0,
+        // A new output renders at the client's cadence after the first
+        // Resize; 60 is only the mode it is created with.
+        refresh_hz: 60,
         headless: Some(instance.clone()),
+        remove_on_drop: !persistent,
         awake: None,
     };
     wait_for_output(&output.name, wait, || {
@@ -1733,18 +1829,37 @@ fn setup_output(
         let Some(m) = mons.iter().find(|m| m.name == output.name) else {
             continue;
         };
-        applied = Some((m.width, m.height, m.scale));
+        applied = Some((m.width, m.height, m.scale, refresh_hz(m.refresh_rate)));
         if m.width == width && m.height == height {
             break;
         }
     }
-    let (w, h, scale) = applied.context("headless output vanished")?;
+    let (w, h, scale, hz) = applied.context("headless output vanished")?;
     output.width = w & !1;
     output.height = h & !1;
     output.scale = scale;
+    output.refresh_hz = hz;
     // An output added while the remote sleeps comes up switched off.
     output.awake = Some(KeepAwake::start(instance.clone(), output.name.clone())?);
     Ok(output)
+}
+
+/// The cadence a session may use: the output's refresh, lowered to an
+/// explicit cap when one is set.
+fn capped_fps(refresh_hz: u32, cap: Option<u32>) -> u32 {
+    cap.map_or(refresh_hz, |c| refresh_hz.min(c))
+        .clamp(1, MAX_FPS_LIMIT)
+}
+
+/// A refresh rate as a whole number of hertz, falling back to 60 when the
+/// compositor does not report one.
+fn refresh_hz(refresh_rate: f64) -> u32 {
+    let hz = refresh_rate.round();
+    if hz.is_finite() && (1.0..=1000.0).contains(&hz) {
+        hz as u32
+    } else {
+        60
+    }
 }
 
 /// A timed-out request may still finish in the compositor. An explicit

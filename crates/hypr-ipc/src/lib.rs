@@ -153,6 +153,13 @@ impl Instance {
         self.request_json("monitors all")
     }
 
+    /// The mapped windows, with the monitor each one is on and the process
+    /// that owns it. A client finds its own window by pid, and so the
+    /// monitor whose refresh rate it should ask the server to match.
+    pub fn clients(&self) -> Result<Vec<Client>> {
+        self.request_json("clients")
+    }
+
     /// Run a dispatcher. A legacy (hyprlang) config takes `dispatch <name>
     /// <args>`; a Lua config reads `dispatch` as `hl.dispatch(...)`, rejects
     /// that form, and takes the `hl.dsp` call in `lua` instead.
@@ -161,7 +168,7 @@ impl Instance {
             return Ok(());
         }
         match self.dispatch(&format!("dispatch {legacy}")) {
-            Err(Error::Command { response, .. }) if response.contains("lua") => {
+            Err(Error::Command { response, .. }) if refused_by_lua(&response) => {
                 if allowed() {
                     self.dispatch(&format!("dispatch {lua}"))
                 } else {
@@ -213,11 +220,11 @@ impl Instance {
     ) -> Result<()> {
         let keyword = format!("keyword monitor {name},{width}x{height}@{hz},auto,{scale}");
         match self.dispatch(&keyword) {
-            Err(Error::Command { response, .. }) if response.contains("non-legacy") => {
-                self.dispatch(&format!(
+            Err(Error::Command { response, .. }) if refused_by_lua(&response) => self.dispatch(
+                &format!(
                     "eval hl.monitor({{ output = \"{name}\", mode = \"{width}x{height}@{hz}\", position = \"auto\", scale = {scale} }})"
-                ))
-            }
+                ),
+            ),
             other => other,
         }
     }
@@ -269,6 +276,26 @@ pub struct Monitor {
     /// False while DPMS has the monitor off; Hyprland does not render it.
     #[serde(default = "yes")]
     pub dpms_status: bool,
+}
+
+/// Whether a refusal means the config parser has no legacy form for this
+/// command. Older Hyprland names the Lua parser; 0.57 answers "unknown
+/// request" without naming anything, so both are recognised.
+fn refused_by_lua(response: &str) -> bool {
+    response.contains("lua") || response.contains("unknown request")
+}
+
+/// A mapped window, as far as gliff needs it: which process owns it and
+/// which monitor it is on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Client {
+    #[serde(default)]
+    pub pid: i32,
+    /// The monitor's id, to match against [`Monitor::id`].
+    #[serde(default)]
+    pub monitor: i64,
+    #[serde(default)]
+    pub class: String,
 }
 
 fn yes() -> bool {
