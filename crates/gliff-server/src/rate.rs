@@ -523,6 +523,8 @@ pub struct RateController {
     target: u32,
     /// Set by `--bitrate`: an upper cap the target never exceeds.
     fixed_cap: Option<u32>,
+    /// Set by `--fixed-bitrate`: hold `target` instead of adapting.
+    pinned: bool,
     slow_start: bool,
     started: Option<Instant>,
     startup_idle_since: Option<Instant>,
@@ -564,6 +566,7 @@ impl RateController {
             floor_bpf: 0,
             target: 0,
             fixed_cap,
+            pinned: false,
             slow_start: true,
             started: None,
             startup_idle_since: None,
@@ -614,7 +617,22 @@ impl RateController {
     /// the bounds and keep the same bits per second where possible.
     pub fn reconfigure(&mut self, pixels: u64, streams: u32, max_fps: u32) {
         self.set_bounds(pixels, streams, max_fps);
-        self.target = self.target.clamp(self.min, self.effective_max());
+        self.target = if self.pinned {
+            self.effective_max()
+        } else {
+            self.target.clamp(self.min, self.effective_max())
+        };
+    }
+
+    /// Hold one bitrate instead of adapting to the link. A noisy link (Wi-Fi
+    /// with a deep queue) makes the estimator see capacity collapse and
+    /// recover every second; the oscillation costs more quality than the
+    /// queueing it avoids. `--fixed-bitrate` picks the rate by hand.
+    pub fn pin(&mut self, bps: u32) {
+        self.fixed_cap = Some(bps);
+        self.pinned = true;
+        self.slow_start = false;
+        self.target = bps.clamp(self.min, self.effective_max());
     }
 
     pub fn target(&self) -> u32 {
@@ -687,6 +705,9 @@ impl RateController {
     /// Feed one ack. Returns the reason when the target changed.
     pub fn on_ack(&mut self, now: Instant, link: &mut LinkEstimator) -> Option<Reason> {
         self.got_ack = true;
+        if self.pinned {
+            return None;
+        }
         let started = *self.started.get_or_insert(now);
 
         if self.slow_start {

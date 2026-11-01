@@ -35,6 +35,9 @@ use crate::notify;
 pub struct Config {
     pub target: Target,
     pub output: Option<String>,
+    /// The output is the client's own screen: create it if it is missing and
+    /// resize it to the client's window and refresh rate.
+    pub headless: bool,
     pub render_node: PathBuf,
     pub low_bandwidth: bool,
     pub bitrate: Option<u32>,
@@ -46,6 +49,8 @@ pub struct Config {
     /// Cap on the stream and headless-output refresh, instead of the
     /// client's monitor refresh.
     pub max_fps: Option<u32>,
+    /// Hold this bitrate instead of adapting (see [`RateController::pin`]).
+    pub fixed_bitrate: Option<u32>,
     /// Per-stream bits per pixel the ladder picks the frame rate for.
     pub quality_bpp: f64,
 }
@@ -1364,12 +1369,15 @@ impl VideoStart {
             );
         }
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
-        let ctl = RateController::new(
+        let mut ctl = RateController::new(
             stream.0 as u64 * stream.1 as u64,
             streams,
             max_fps,
             cfg.bitrate,
         );
+        if let Some(bps) = cfg.fixed_bitrate {
+            ctl.pin(bps);
+        }
         let settings = encoder_settings(
             stream.0,
             stream.1,
@@ -1612,8 +1620,9 @@ impl<O, C, I> DerefMut for ServedOutput<O, C, I> {
     }
 }
 
-/// The output being served. A created headless output is removed on drop, on
-/// every exit path including a failure later in setup.
+/// The output being served. A created headless output is resized to the
+/// client's window; one the client only owns for this session is removed on
+/// drop, on every exit path including a failure later in setup.
 struct SessionOutput {
     name: String,
     /// Physical (captured) size.
@@ -1623,7 +1632,13 @@ struct SessionOutput {
     scale: f32,
     /// The output's refresh rate in Hz: the ceiling the stream paces to.
     refresh_hz: u32,
+    /// Some when the output is virtual (created by gliff, or a persistent
+    /// virtual output gliff was pointed at), so its mode follows the window.
     headless: Option<hypr_ipc::Instance>,
+    /// Remove the virtual output when the session ends. False for a
+    /// persistent one (`--headless --output NAME`), which keeps its
+    /// workspaces for the next connection.
+    remove_on_drop: bool,
     awake: Option<KeepAwake>,
 }
 
@@ -1647,8 +1662,10 @@ impl Drop for SessionOutput {
         // Join the poller before removing its output, so every in-flight
         // DPMS request finishes while we still own the monitor.
         drop(self.awake.take());
-        if let Some(instance) = &self.headless {
-            let _ = instance.remove_output(&self.name);
+        if self.remove_on_drop {
+            if let Some(instance) = &self.headless {
+                let _ = instance.remove_output(&self.name);
+            }
         }
     }
 }
@@ -1697,39 +1714,80 @@ fn encoder_settings(
     }
 }
 
-/// Pick the named output, or create a headless one sized to the client.
+/// A mirror of an existing output: the remote keeps its own mode, and the
+/// stream is fitted into the client's window.
+fn mirror_output(m: &hypr_ipc::Monitor) -> SessionOutput {
+    SessionOutput {
+        name: m.name.clone(),
+        width: if m.transform & 1 != 0 {
+            m.height
+        } else {
+            m.width
+        } & !1,
+        height: if m.transform & 1 != 0 {
+            m.width
+        } else {
+            m.height
+        } & !1,
+        scale: m.scale,
+        refresh_hz: refresh_hz(m.refresh_rate),
+        headless: None,
+        remove_on_drop: false,
+        awake: None,
+    }
+}
+
+/// Pick the named output, or create a virtual one sized to the client.
+/// `--headless` alone creates a private output that is removed on exit;
+/// `--headless --output NAME` adopts (or creates) a persistent virtual
+/// output, so the desktop on it survives reconnects and is resized to the
+/// window each time.
 fn setup_output(
     instance: &hypr_ipc::Instance,
     cfg: &Config,
     caps: &ClientCaps,
 ) -> Result<SessionOutput> {
-    if let Some(name) = &cfg.output {
+    if let Some(name) = cfg.output.as_deref().filter(|name| *name != "auto") {
+        let mons = instance.monitors()?;
+        if let Some(m) = mons.iter().find(|m| m.name == name) {
+            // Called with --headless, the named output is the client's
+            // virtual screen, so its mode follows the window. Without it,
+            // this is an ordinary mirror of a real monitor.
+            let mut output = mirror_output(m);
+            if cfg.headless {
+                output.headless = Some(instance.clone());
+                // A persistent virtual output idles between connections and
+                // may have been switched off; keep it on, as a created one is.
+                output.awake = Some(KeepAwake::start(instance.clone(), output.name.clone())?);
+            }
+            return Ok(output);
+        }
+        if !cfg.headless {
+            anyhow::bail!("no output {name}");
+        }
+        // A named virtual output that does not exist yet: with a real
+        // monitor attached, mirror it instead of adding an empty screen
+        // beside it. It is created below only for a headless compositor.
+        if let Some(m) = main_monitor(&mons).filter(|m| m.name != "FALLBACK") {
+            tracing::info!(output = %m.name, "no virtual output yet; mirroring the attached monitor");
+            return Ok(mirror_output(m));
+        }
+    } else if !cfg.headless {
+        let name = cfg.output.as_deref().unwrap_or("auto");
         let mons = instance.monitors()?;
         let m = if name == "auto" {
             main_monitor(&mons)
         } else {
-            mons.iter().find(|m| &m.name == name)
+            mons.iter().find(|m| m.name == name)
         }
         .with_context(|| format!("no output {name}"))?;
-        return Ok(SessionOutput {
-            name: m.name.clone(),
-            width: if m.transform & 1 != 0 {
-                m.height
-            } else {
-                m.width
-            } & !1,
-            height: if m.transform & 1 != 0 {
-                m.width
-            } else {
-                m.height
-            } & !1,
-            scale: m.scale,
-            refresh_hz: refresh_hz(m.refresh_rate),
-            headless: None,
-            awake: None,
-        });
+        return Ok(mirror_output(m));
     }
-    let requested = format!("gliff-{}", std::process::id());
+    let persistent = cfg.output.is_some();
+    let requested = cfg
+        .output
+        .clone()
+        .unwrap_or_else(|| format!("gliff-{}", std::process::id()));
     let (wait, timed_out) = match instance.create_headless_output(&requested) {
         Ok(()) => (Duration::from_secs(1), None),
         Err(e) if creation_may_complete(&e) => {
@@ -1749,6 +1807,7 @@ fn setup_output(
         // Resize; 60 is only the mode it is created with.
         refresh_hz: 60,
         headless: Some(instance.clone()),
+        remove_on_drop: !persistent,
         awake: None,
     };
     wait_for_output(&output.name, wait, || {

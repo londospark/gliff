@@ -61,11 +61,14 @@ struct Cli {
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
-    /// Create a private headless output on the remote, sized, scaled and
-    /// paced to this window, instead of mirroring the remote's focused screen.
-    #[arg(long, conflicts_with = "output")]
+    /// Create a virtual output on the remote, sized, scaled and paced to
+    /// this window, instead of mirroring the remote's focused screen. With
+    /// `--output NAME` the output is persistent: it is created once, keeps
+    /// its workspaces across connections, and is resized each time.
+    #[arg(long)]
     headless: bool,
-    /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
+    /// Mirror the named remote output (e.g. `DP-1`) instead of the focused
+    /// one. With `--headless`, names the persistent virtual output.
     #[arg(long)]
     output: Option<String>,
     /// Hotkey that releases captured shortcuts and hands the keyboard back to
@@ -270,7 +273,8 @@ fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
     let mut t = SshTarget::new(host.to_string());
     t.server_bin = cli.server_bin.clone();
     let mut args = match (&cli.output, cli.headless) {
-        (Some(name), _) => vec!["--output".into(), name.clone()],
+        (Some(name), true) => vec!["--headless".into(), "--output".into(), name.clone()],
+        (Some(name), false) => vec!["--output".into(), name.clone()],
         (None, true) => vec!["--headless".into()],
         (None, false) => vec!["--output".into(), "auto".into()],
     };

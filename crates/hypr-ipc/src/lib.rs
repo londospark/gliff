@@ -168,7 +168,7 @@ impl Instance {
             return Ok(());
         }
         match self.dispatch(&format!("dispatch {legacy}")) {
-            Err(Error::Command { response, .. }) if response.contains("lua") => {
+            Err(Error::Command { response, .. }) if refused_by_lua(&response) => {
                 if allowed() {
                     self.dispatch(&format!("dispatch {lua}"))
                 } else {
@@ -220,7 +220,7 @@ impl Instance {
     ) -> Result<()> {
         let keyword = format!("keyword monitor {name},{width}x{height}@{hz},auto,{scale}");
         match self.dispatch(&keyword) {
-            Err(Error::Command { response, .. }) if response.contains("non-legacy") => {
+            Err(Error::Command { response, .. }) if refused_by_lua(&response) => {
                 self.dispatch(&format!(
                     "eval hl.monitor({{ output = \"{name}\", mode = \"{width}x{height}@{hz}\", position = \"auto\", scale = {scale} }})"
                 ))
@@ -276,6 +276,15 @@ pub struct Monitor {
     /// False while DPMS has the monitor off; Hyprland does not render it.
     #[serde(default = "yes")]
     pub dpms_status: bool,
+}
+
+/// Whether a refusal means the config parser has no legacy form for this
+/// command. Older Hyprland names the Lua parser; 0.57 answers "unknown
+/// request" without naming anything, so both are recognised.
+fn refused_by_lua(response: &str) -> bool {
+    response.contains("lua")
+        || response.contains("non-legacy")
+        || response.contains("unknown request")
 }
 
 /// A mapped window, as far as gliff needs it: which process owns it and
